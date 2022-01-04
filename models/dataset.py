@@ -7,31 +7,18 @@ from glob import glob
 from icecream import ic
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
+import pickle
 
+import diffoptics as optics
+from diffoptics import Rays
+import sys
 
-# This function is borrowed from IDR: https://github.com/lioryariv/idr
-def load_K_Rt_from_P(filename, P=None):
-    if P is None:
-        lines = open(filename).read().splitlines()
-        if len(lines) == 4:
-            lines = lines[1:]
-        lines = [[x[0], x[1], x[2], x[3]] for x in (x.split(" ") for x in lines)]
-        P = np.asarray(lines).astype(np.float32).squeeze()
+# Path to your local clone of the magis simulator
+SIMULATOR_PATH = '/sdf/home/s/sgaz/Magis-simulator'
+sys.path.insert(0, SIMULATOR_PATH)
 
-    out = cv.decomposeProjectionMatrix(P)
-    K = out[0]
-    R = out[1]
-    t = out[2]
-
-    K = K / K[2, 2]
-    intrinsics = np.eye(4)
-    intrinsics[:3, :3] = K
-
-    pose = np.eye(4, dtype=np.float32)
-    pose[:3, :3] = R.transpose()
-    pose[:3, 3] = (t[:3] / t[3])[:, 0]
-
-    return intrinsics, pose
+from magis.main_helpers import make_scene, get_sensor_index_positions, get_positions
+from magis.mirror_utils import get_views_given_fixed_mirrors_smooth
 
 
 class Dataset:
@@ -41,56 +28,77 @@ class Dataset:
         self.device = torch.device('cuda')
         self.conf = conf
 
-        self.data_dir = conf.get_string('data_dir')
-        self.render_cameras_name = conf.get_string('render_cameras_name')
-        self.object_cameras_name = conf.get_string('object_cameras_name')
+        self.dset_name = conf['dset_path']
+        self.calib_name = conf['calib_path']
+        with open(self.dset_name,'rb') as f:
+             in_dataset = pickle.load(f)
 
-        self.camera_outside_sphere = conf.get_bool('camera_outside_sphere', default=True)
-        self.scale_mat_scale = conf.get_float('scale_mat_scale', default=1.1)
+        #with open(calib_name, 'rb') as f:
+        #     calib_dict = pickle.load(f)
 
-        camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
-        self.camera_dict = camera_dict
-        self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
-        self.n_images = len(self.images_lis)
-        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
-        self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
-        self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
-
-        # world_mat is a projection matrix from world to image
-        self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
-
-        self.scale_mats_np = []
-
-        # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
-        self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
-
-        self.intrinsics_all = []
-        self.pose_all = []
-
-        for scale_mat, world_mat in zip(self.scale_mats_np, self.world_mats_np):
-            P = world_mat @ scale_mat
-            P = P[:3, :4]
-            intrinsics, pose = load_K_Rt_from_P(None, P)
-            self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
-            self.pose_all.append(torch.from_numpy(pose).float())
-
-        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()   # [n_images, H, W, 3]
-        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
-        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
-        self.focal = self.intrinsics_all[0][0, 0]
-        self.pose_all = torch.stack(self.pose_all).to(self.device)  # [n_images, 4, 4]
-        self.H, self.W = self.images.shape[1], self.images.shape[2]
+        self.H, self.W = in_dataset.shape[1:3]
         self.image_pixels = self.H * self.W
+
+        in_dataset = in_dataset.reshape(in_dataset.shape[0], -1, 6)
+        assert in_dataset.shape == (in_dataset.shape[0], self.H*self.W, 1+1+1+3)
+        self.in_dataset = torch.from_numpy(in_dataset)
+
+        self.n_images = len(self.in_dataset)
+
+        #Let's try to put a MAGIS scene in here
+        # Get mirror parameters
+        m = conf['m']
+        f = conf['f']
+
+        xm,ym,zm,mirror_radii,angles,theta,phi,foc,obj = get_views_given_fixed_mirrors_smooth(
+            m  = m,
+            f  = f * 100,
+            fn = 1.23,
+            sv = 24/10,
+            sh = 24/10,
+            skipmirrs=5,
+            extreme_view_angle = np.radians(55),
+            window_pos = 3.0,
+            fixed_radii = [.25],
+            num_mirrors = [500])
+
+        #assert len(angles) == self.in_dataset.shape[0]
+
+        normals = torch.zeros((len(angles), 3))
+        for i in range(len(theta)):
+            normal_angles = angles
+            normal = optics.vector(np.cos(normal_angles[i]),
+                                   np.cos(theta[i]) * np.sin(normal_angles[i]),
+                                   np.sin(theta[i]) * np.sin(normal_angles[i]))
+            normals[i] = optics.normalize_vector(normal)
+
+
+        mirror_parameters = normals, torch.tensor(xm / 100, dtype=torch.float), torch.tensor(ym / 100, dtype=torch.float), torch.tensor(zm / 100, dtype=torch.float), torch.tensor(mirror_radii / 100, dtype=torch.float)
+
+        # @Todo check sensor parameters
+        pixel_size = conf['pixel_size']
+        self.scene = make_scene(object_x_pos=obj/100, f=f, m=m, na=1 / 1.4, nb_mirror=None, sensor_resolution=(conf['sensor_resolution_x'],conf['sensor_resolution_y']),
+                       sensor_pixel_size=(pixel_size, pixel_size), poisson_noise_mean=2, quantum_efficiency=0.77,
+                       mirror_parameters=mirror_parameters)
+
+        self.continuous_positions = get_positions(self.scene)
+
+        rad = conf['rad']
+        trans_mat = torch.eye(4)
+        trans_mat[0][3] = -obj/100* 1/rad
+
+        scale_mat = torch.eye(4)
+        scale_mat[0][0] = 1/rad
+        scale_mat[1][1] = 1/rad
+        scale_mat[2][2] = 1/rad
+
+        full_scale_mat = torch.matmul(trans_mat, scale_mat)[:-1]
+        self.full_scale_mat = full_scale_mat
 
         object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
         object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
-        # Object scale mat: region of interest to **extract mesh**
-        object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
-        object_bbox_min = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_min[:, None]
-        object_bbox_max = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_max[:, None]
-        self.object_bbox_min = object_bbox_min[:3, 0]
-        self.object_bbox_max = object_bbox_max[:3, 0]
+        self.object_bbox_min = object_bbox_min[:, None][:3, 0]
+        self.object_bbox_max = object_bbox_max[:, None][:3, 0]
 
         print('Load data: End')
 
@@ -166,6 +174,88 @@ class Dataset:
         return near, far
 
     def image_at(self, idx, resolution_level):
-        img = cv.imread(self.images_lis[idx])
-        return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
+        #img = cv.imread(self.images_lis[idx])
+        img = self.in_dataset[idx, :, -3:].reshape((self.W,self.W, 3)).numpy()*256
+        return (cv.resize(img, (self.W // resolution_level, self.W // resolution_level))).clip(0, 255).astype(np.uint8)
+        #return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
 
+    def gen_rays_at_magis(self, lens, mirror, data_id, mirror_id):
+        """
+        Generate rays at world space from one camera.
+        """
+        ind = torch.arange(self.H*self.W)
+        # Sampling rays from the sensor to the lens
+        origins = torch.zeros(ind.shape[0], 3, device=self.device)
+        origins[:, 0] = self.continuous_positions[mirror_id][0]
+        origins[:, 1] = self.in_dataset[data_id, ind, 1]
+        origins[:, 2] = self.in_dataset[data_id, ind, 2]
+        points_on_lens = lens.sample_points_on_lens(ind.shape[0], device=self.device)
+        directions = optics.batch_vector(points_on_lens[:, 0] - origins[:, 0],
+                                         points_on_lens[:, 1]*0 - origins[:, 1],
+                                         points_on_lens[:, 2]*0 - origins[:, 2])
+        rays_sensor_to_lens = Rays(origins, directions, device=self.device,
+                                   meta = {'target' : self.in_dataset[data_id, ind, -3:].to(self.device),
+                                           'ind' : ind})
+
+        # Intersection with lens
+        t1 = lens.get_ray_intersection(rays_sensor_to_lens)
+        mask_t1 = ~torch.isnan(t1)
+        ray_lens_to_mirror = lens.intersect(rays_sensor_to_lens.get_at(mask_t1), t1[mask_t1])
+
+        # Intersection with mirror
+        t2 = mirror.get_ray_intersection(ray_lens_to_mirror)
+        mask = ~torch.isnan(t2)
+        assert mask.shape[0] == ind[mask_t1].shape[0]
+        #rays_mirror_to_object = mirror.intersect(ray_lens_to_mirror.get_at(mask), t2[mask])
+        rays_mirror_to_object = mirror.intersect(ray_lens_to_mirror, t2)
+
+        color = self.in_dataset[data_id, ind[mask_t1], -3:]
+
+        rays_mirror_to_object.origins = torch.matmul(self.full_scale_mat, 
+             torch.cat((rays_mirror_to_object.origins, torch.ones((rays_mirror_to_object.origins.shape[0],1))), dim=1)[:, :, np.newaxis]).squeeze(dim=-1)
+        rays_mirror_to_object.directions = torch.matmul(self.full_scale_mat,
+             torch.cat((rays_mirror_to_object.directions, torch.zeros((rays_mirror_to_object.origins.shape[0],1))), dim=1)[:, :, np.newaxis]).squeeze(dim=-1)
+
+        rays_mirror_to_object.directions = rays_mirror_to_object.directions/torch.sqrt(torch.sum(rays_mirror_to_object.directions**2, dim=1, keepdim=True))
+
+        return rays_mirror_to_object, color.cuda()
+
+
+    def gen_random_rays_at_magis(self, lens, mirror, ind, data_id, mirror_id):
+        """
+        Generate random rays at world space from one camera.
+        """
+        # Sampling rays from the sensor to the lens
+        origins = torch.zeros(ind.shape[0], 3, device=self.device)
+        origins[:, 0] = self.continuous_positions[mirror_id][0]
+        origins[:, 1] = self.in_dataset[data_id, ind, 1]
+        origins[:, 2] = self.in_dataset[data_id, ind, 2]
+        points_on_lens = lens.sample_points_on_lens(ind.shape[0], device=self.device)
+        directions = optics.batch_vector(points_on_lens[:, 0] - origins[:, 0],
+                                         points_on_lens[:, 1]*0 - origins[:, 1],
+                                         points_on_lens[:, 2]*0 - origins[:, 2])
+        rays_sensor_to_lens = Rays(origins, directions, device=self.device,
+                                   meta = {'target' : self.in_dataset[data_id, ind, -3:].to(self.device),
+                                           'ind' : ind})
+
+        # Intersection with lens
+        t1 = lens.get_ray_intersection(rays_sensor_to_lens)
+        mask_t1 = ~torch.isnan(t1)
+        ray_lens_to_mirror = lens.intersect(rays_sensor_to_lens.get_at(mask_t1), t1[mask_t1])
+
+        # Intersection with mirror
+        t2 = mirror.get_ray_intersection(ray_lens_to_mirror)
+        mask = ~torch.isnan(t2)
+        assert mask.shape[0] == ind[mask_t1].shape[0]
+        rays_mirror_to_object = mirror.intersect(ray_lens_to_mirror.get_at(mask), t2[mask])
+        
+        color = self.in_dataset[data_id, ind[mask_t1][mask], -3:]
+
+        rays_mirror_to_object.origins = torch.matmul(self.full_scale_mat,
+             torch.cat((rays_mirror_to_object.origins, torch.ones((rays_mirror_to_object.origins.shape[0],1))), dim=1)[:, :, np.newaxis]).squeeze(dim=-1)
+        rays_mirror_to_object.directions = torch.matmul(self.full_scale_mat,
+             torch.cat((rays_mirror_to_object.directions, torch.zeros((rays_mirror_to_object.origins.shape[0],1))), dim=1)[:, :, np.newaxis]).squeeze(dim=-1)
+
+        rays_mirror_to_object.directions = rays_mirror_to_object.directions/torch.sqrt(torch.sum(rays_mirror_to_object.directions**2, dim=1, keepdim=True))
+        
+        return rays_mirror_to_object, color.cuda()
